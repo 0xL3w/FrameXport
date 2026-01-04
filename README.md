@@ -17,4 +17,4 @@ The core functionality of UxPlay has been retained, excluding Gstreamer, with ke
 - **UDP Export functionality** - This modification introduces a feature which sends frame data over the UDP protocol, instead of sending this to Gstreamer for decoding. Gstreamer is disabled.
 
 **License**
-- This project is licensed under the same terms as the [UxPlay repository(https://github.com/FDH2/UxPlay). [See the full license here](https://github.com/FDH2/UxPlay?tab=GPL-3.0-1-ov-file)
+- This project is licensed under the same terms as the [UxPlay repository](https://github.com/FDH2/UxPlay). [See the full license here](https://github.com/FDH2/UxPlay?tab=GPL-3.0-1-ov-file)
