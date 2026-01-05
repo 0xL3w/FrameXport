@@ -8,8 +8,8 @@ The core functionality of UxPlay has been retained, with key adjustments made to
 
 **Key Features**
 - **RTP Frame export** - Allows frames to be exported via rtp/udp for custom streaming or processing.
-- **Disable Gstreamer** - Allows the users to disable Gstreamer.
-- **Disable Audio** - Currently, when using the "-nogst" flag, audio will be disable. **This may change in future versions**
+- **Disable Gstreamer** - Allows the user to disable Gstreamer.
+- **Disable Audio** - Currently, when using the "-nogst" flag, audio will be disabled. **This may change in future versions**
 
 **Setup**
 - Please follow the build instructions in the original UxPlay README. This can be found here. [UxPlay](https://github.com/FDH2/UxPlay)
