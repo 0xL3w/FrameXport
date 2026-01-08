@@ -36,12 +36,15 @@
 #include <math.h>
 #include <inttypes.h>
 
+
+
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <pthread.h>   //for pthreads in MSYS2 UCRT
+#include <ws2tcpip.h>
 #else
 #include <csignal>
 #include <glib-unix.h>
@@ -50,6 +53,8 @@
 #include <ifaddrs.h>
 #include <sys/types.h>
 #include <pwd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 # ifdef __linux__
 # include <netpacket/packet.h>
 # else
@@ -76,7 +81,7 @@
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
-#define DEFAULT_NAME "UxPlay"
+#define DEFAULT_NAME "(FrameXport) UxPlay"
 #define DEFAULT_DEBUG_LOG false
 #define LOWEST_ALLOWED_PORT 1024
 #define HIGHEST_PORT 65535
@@ -196,6 +201,34 @@ static std::string coverart_artist;
 static std::string ble_filename = "";
 static std::string rtp_pipeline = "";
 static GMainLoop *gmainloop = NULL;
+static bool disable_gstreamer = false; //Disable gstreamer
+static int exit_on_disconnect = 0;  // 0 = disabled, 1-60 = exit after N seconds of disconnect
+
+// RTP streaming variables
+static bool rtp_streaming_enabled = false;
+static int udp_socket = -1;
+static std::string rtp_host = "127.0.0.1";
+static int rtp_port = 5000;
+static struct sockaddr_in udp_dest_addr;
+
+// RTP protocol const
+#define RTP_VERSION 2
+#define RTP_PAYLOAD_TYPE_H264 96
+#define RTP_MAX_PACKET_SIZE 1400
+
+// RTP packet track
+static uint16_t rtp_sequence_number = 0;
+static uint32_t rtp_timestamp = 0;
+static uint32_t rtp_ssrc = 0x12345678;  // Synchronization source ID
+
+// RTP Header structure (12 bytes)
+struct rtp_header {
+    uint8_t  version_flags;   // [V=2|P|X|CC]
+    uint8_t  marker_payload;  // [M|PT]
+    uint16_t sequence;
+    uint32_t timestamp;
+    uint32_t ssrc;
+} __attribute__((packed));
 
 //Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
 static unsigned int scrsv;
@@ -531,6 +564,16 @@ static gboolean feedback_callback(gpointer loop) {
             LOGI("%u missed client feedback signals exceeds limit of %u", missed_feedback, missed_feedback_limit);
             LOGI("   Sometimes the network connection may recover after a longer delay:\n"
                  "   the default limit n = %d seconds, can be changed with the \"-reset n\" option", MISSED_FEEDBACK_LIMIT);
+            
+            // Check if exit-on-disconnect is enabled
+            if (exit_on_disconnect > 0) {
+                LOGI("Client disconnected for %u seconds - exiting (exit-on-disconnect mode)", missed_feedback);
+                relaunch_video = false;
+                reset_loop = true;
+                g_main_loop_quit((GMainLoop *) loop);
+                return TRUE;
+            }
+            
             if (!nofreeze) {
                 close_window = false; /* leave "frozen" window open if reset_video is false */
             }
@@ -898,7 +941,7 @@ static std::string random_mac () {
 }
 
 static void print_info (char *name) {
-    printf("UxPlay %s: An open-source AirPlay mirroring server.\n", VERSION);
+    printf("FrameXport (UxPlay) %s: RTP/UDP AirPlay frame exporter (based on UxPlay). \n", VERSION);
     printf("=========== Website: https://github.com/FDH2/UxPlay ==========\n");
     printf("Usage: %s [-n name] [-s wxh] [-p [n]] [(other options)]\n", name);
     printf("Options:\n");
@@ -995,6 +1038,7 @@ static void print_info (char *name) {
     printf("-v        Displays version information\n");
     printf("-h        Displays this help\n");
     printf("-rc fn    Read startup options from file \"fn\" instead of ~/.uxplayrc, etc\n");
+    printf("-eod [n]  Exit n seconds after client disconnects (default n=15, max 60)\n");
     printf("Startup options in $UXPLAYRC, ~/.uxplayrc, or ~/.config/uxplayrc are\n");
     printf("applied first (command-line options may modify them): format is one \n");
     printf("option per line, no initial \"-\"; lines starting with \"#\" are ignored.\n");
@@ -1703,6 +1747,38 @@ static void parse_arguments (int argc, char *argv[]) {
             h265_support = true;
         } else if (arg == "-nofreeze") {
             nofreeze = true;
+        } else if (arg == "-nogst") {
+            disable_gstreamer = true; //Disable gstreamer (flag)
+        } else if (arg == "-eod") {
+            exit_on_disconnect = 1;  // Flag to enable exit-on-disconnect mode
+            // Default timeout stays at 15 seconds (missed_feedback_limit already = 15)
+            if (i < argc - 1 && *argv[i+1] != '-') {
+                unsigned int n = 60;  // Max 60 seconds
+                if (get_value(argv[++i], &n) && n > 0) {
+                    missed_feedback_limit = n;  // Override the timeout value
+                } else {
+                    fprintf(stderr, "invalid \"-eod %s\"; -eod n must be 1-60 seconds\n", argv[i]);
+                    exit(1);
+                }
+            }
+        } else if (arg == "-rtp") { //rtp (flag) //No port range check for now. May add later
+            rtp_streaming_enabled = true;
+            if (i < argc - 1 && argv[i+1][0] != '-') {
+                std::string value(argv[++i]);
+                size_t pos = value.find(":");
+                if (pos != std::string::npos) {
+                    rtp_host = value.substr(0, pos);
+                    try {
+                        rtp_port = std::stoi(value.substr(pos + 1));
+                    } catch (...) {
+                        fprintf(stderr, "invalid -rtp port number\n");
+                        exit(1);
+                    }
+                } else {
+                    fprintf(stderr, "invalid rtp format, use: -rtp host:port\n");
+                    exit(1);
+                }
+            }
         } else {
             fprintf(stderr, "unknown option %s, stopping (for help use option \"-h\")\n",argv[i]);
             exit(1);
@@ -2073,7 +2149,7 @@ static bool check_blocked_client(char *deviceid) {
 
 extern "C" void video_reset(void *cls, reset_type_t type) {
     LOGD("video_reset");
-    if (use_video) {
+    if (use_video && !disable_gstreamer) { //Disable gstreamer
         video_renderer_stop();
     }
     if (hls_support && (type == RESET_TYPE_HLS_SHUTDOWN || type == RESET_TYPE_NOHOLD)) { 
@@ -2084,7 +2160,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         raop_remove_hls_connections(raop);
         preserve_connections = true;
     }
-    if (use_video && (type == RESET_TYPE_NOHOLD || type == RESET_TYPE_HLS_EOS)) {
+    if (use_video && !disable_gstreamer && (type == RESET_TYPE_NOHOLD || type == RESET_TYPE_HLS_EOS)) { //Disable gstreamer
         /* reset the video renderer immediately to avoid a timing issue if we wait for main_loop to reset */ 
         video_renderer_destroy();
         video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
@@ -2099,11 +2175,14 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     }
     
     remote_clock_offset = 0;
-    relaunch_video = true;
+    relaunch_video = !disable_gstreamer; //Disable Gstreamer
     reset_loop = true;
 }
 
 extern "C" int video_set_codec(void *cls, video_codec_t codec) {
+    if (disable_gstreamer){
+        return 0; //Return success when Gstreamer is disabled //Disable Gstreamer
+    }
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
     return video_renderer_choose_codec(false, video_is_h265);
 }
@@ -2182,6 +2261,11 @@ extern "C" void conn_reset (void *cls, int reason) {
       break;
     }
     
+    // If exit-on-disconnect is enabled, log that we'll exit after timeout
+    if (exit_on_disconnect > 0) {
+        LOGI("Client disconnected - will exit after timeout (exit-on-disconnect mode)");
+    }
+    
     if (!nofreeze) {
         close_window = false;    /* leave "frozen" window open */
     }
@@ -2246,10 +2330,25 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     }
 }
 
+
+static void send_rtp_frame(unsigned char *data, int data_len); //RTP Function fwrd decl
+
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
+    LOGI("video_process called: %d bytes", data->data_len);
+    
     if (dump_video) {
         dump_video_to_file(data->data, data->data_len);
     }
+
+    if (disable_gstreamer) {
+        if (rtp_streaming_enabled) {
+            send_rtp_frame(data->data, data->data_len);
+        } else {
+            LOGD("Received video frame: %d bytes", data->data_len);
+        }
+        return;
+    }
+
     if (use_video) {
         if (!remote_clock_offset) {
             uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
@@ -2291,13 +2390,13 @@ extern "C" void mirror_video_activity  (void *cls, double *txusage) {
 #endif
 
 extern "C" void video_pause (void *cls) {
-    if (use_video) {
+    if (use_video && !disable_gstreamer) { //Disable gstreamer
         video_renderer_pause();
     }
 }
 
 extern "C" void video_resume (void *cls) {
-    if (use_video) {
+    if (use_video && !disable_gstreamer) { //Disable gstreamer
         video_renderer_resume();
     }
 }
@@ -2310,7 +2409,7 @@ extern "C" void audio_flush (void *cls) {
 }
 
 extern "C" void video_flush (void *cls) {
-    if (use_video) {
+    if (use_video && !disable_gstreamer) {
         video_renderer_flush();
     }
 }
@@ -2765,6 +2864,178 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
     }
 }
 
+static int init_rtp_socket() { //RTP socket initialization
+#ifdef _WIN32
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        LOGE("WSAStartup failed");
+        return -1;
+    }
+#endif
+
+    udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_socket < 0) {
+        LOGE("Failed to create RTP socket");
+        return -1;
+    }
+
+    memset(&udp_dest_addr, 0, sizeof(udp_dest_addr));
+    udp_dest_addr.sin_family = AF_INET;
+    udp_dest_addr.sin_port = htons(rtp_port);
+    
+    if (inet_pton(AF_INET, rtp_host.c_str(), &udp_dest_addr.sin_addr) <= 0) {
+        LOGE("Invalid RTP destination address: %s", rtp_host.c_str());
+#ifdef _WIN32
+        closesocket(udp_socket);
+#else
+        close(udp_socket);
+#endif
+        udp_socket = -1;
+        return -1;
+    }
+
+    LOGI("RTP socket initialized for %s:%d", rtp_host.c_str(), rtp_port);
+    return 0;
+}
+
+static void send_rtp_frame(unsigned char *data, int data_len) {
+    if (udp_socket < 0 || data_len < 1) {
+        return;
+    }
+
+    // Process all NAL units in this frame (there might be multiple)
+    int offset = 0;
+    while (offset < data_len) {
+        // Skip H.264 start code if present (00 00 00 01 or 00 00 01)
+        int nal_start = 0;
+        if (offset + 4 <= data_len && data[offset] == 0 && data[offset + 1] == 0) {
+            if (data[offset + 2] == 0 && data[offset + 3] == 1) {
+                nal_start = 4;  // 4-byte start code
+            } else if (data[offset + 2] == 1) {
+                nal_start = 3;  // 3-byte start code
+            }
+        }
+        
+        offset += nal_start;
+        if (offset >= data_len) {
+            break;  // No more data
+        }
+
+        // Find the next start code to determine this NAL's length
+        int nal_length = data_len - offset;  // Default to rest of data
+        for (int i = offset + 1; i < data_len - 3; i++) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                if ((data[i + 2] == 0 && data[i + 3] == 1) || data[i + 2] == 1) {
+                    nal_length = i - offset;  // Found next NAL
+                    break;
+                }
+            }
+        }
+
+        // Now process this single NAL unit
+        unsigned char *nal_data = data + offset;
+        
+        if (nal_length < 1) {
+            break;
+        }
+
+        // H.264 NAL unit type is in lower 5 bits of first byte
+        uint8_t nal_header = nal_data[0];
+        uint8_t nal_type = nal_header & 0x1F;
+
+        // Log NAL type for all frames
+        LOGI("Processing NAL type=%u, size=%d", nal_type, nal_length);
+
+        // If NAL unit fits in one packet (< max size), send as Single NAL Unit
+        if (nal_length <= RTP_MAX_PACKET_SIZE) {
+            // Build RTP header
+            struct rtp_header rtp;
+            rtp.version_flags = (RTP_VERSION << 6);
+            rtp.marker_payload = (1 << 7) | RTP_PAYLOAD_TYPE_H264;  // Marker bit = 1 (end of frame)
+            rtp.sequence = htons(rtp_sequence_number++);
+            rtp.timestamp = htonl(rtp_timestamp);
+            rtp.ssrc = htonl(rtp_ssrc);
+
+            // Send RTP header + complete NAL unit
+            unsigned char *packet = (unsigned char*)malloc(12 + nal_length);
+            if (!packet) {
+                LOGE("Failed to allocate RTP packet");
+                return;
+            }
+
+            memcpy(packet, &rtp, 12);
+            memcpy(packet + 12, nal_data, nal_length);
+
+            sendto(udp_socket, (const char*)packet, 12 + nal_length, 0,
+                   (struct sockaddr*)&udp_dest_addr, sizeof(udp_dest_addr));
+
+            free(packet);
+            LOGI("RTP sent single NAL: seq=%u, type=%u, size=%d", rtp_sequence_number - 1, nal_type, nal_length);
+        } 
+        else {
+            // Fragment large NAL unit using FU-A (Fragmentation Unit A)
+            uint8_t nal_fu_indicator = (nal_header & 0xE0) | 28;  // FU-A type = 28
+            uint8_t nal_fu_header;
+            
+            int nal_payload_len = nal_length - 1;  // Skip original NAL header
+            unsigned char *nal_payload = nal_data + 1;
+            int frag_offset = 0;
+            bool first_fragment = true;
+
+            while (frag_offset < nal_payload_len) {
+                int fragment_size = (nal_payload_len - frag_offset > RTP_MAX_PACKET_SIZE - 2) 
+                                    ? (RTP_MAX_PACKET_SIZE - 2) 
+                                    : (nal_payload_len - frag_offset);
+                
+                bool last_fragment = (frag_offset + fragment_size >= nal_payload_len);
+
+                // Build FU-A header: S|E|R|Type
+                nal_fu_header = (first_fragment ? 0x80 : 0x00) |  // S bit (start)
+                               (last_fragment ? 0x40 : 0x00) |    // E bit (end)
+                               nal_type;                          // Original NAL type
+
+                // Build RTP header
+                struct rtp_header rtp;
+                rtp.version_flags = (RTP_VERSION << 6);
+                rtp.marker_payload = (last_fragment ? (1 << 7) : 0) | RTP_PAYLOAD_TYPE_H264;  // Marker on last fragment
+                rtp.sequence = htons(rtp_sequence_number++);
+                rtp.timestamp = htonl(rtp_timestamp);
+                rtp.ssrc = htonl(rtp_ssrc);
+
+                // Build packet: [RTP header][FU indicator][FU header][fragment data]
+                int packet_size = 12 + 2 + fragment_size;
+                unsigned char *packet = (unsigned char*)malloc(packet_size);
+                if (!packet) {
+                    LOGE("Failed to allocate RTP fragment");
+                    return;
+                }
+
+                memcpy(packet, &rtp, 12);
+                packet[12] = nal_fu_indicator;
+                packet[13] = nal_fu_header;
+                memcpy(packet + 14, nal_payload + frag_offset, fragment_size);
+
+                sendto(udp_socket, (const char*)packet, packet_size, 0,
+                       (struct sockaddr*)&udp_dest_addr, sizeof(udp_dest_addr));
+
+                free(packet);
+
+                LOGI("RTP sent FU-A fragment: seq=%u, S=%d, E=%d, size=%d", 
+                     rtp_sequence_number - 1, first_fragment, last_fragment, fragment_size);
+
+                frag_offset += fragment_size;
+                first_fragment = false;
+            }
+        }
+
+        // Move to next NAL unit
+        offset += nal_length;
+    }
+
+    // Increment timestamp for next frame (90kHz clock, assume 30fps = 3000 ticks)
+    rtp_timestamp += 3000;
+}
+
 #ifdef GST_MACOS
 /* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
 #include <TargetConditionals.h>
@@ -2842,10 +3113,35 @@ int main (int argc, char *argv[]) {
     }
     parse_arguments (argc, argv);
 
+    //Disable gstreamer (log)
+    if (disable_gstreamer) {
+        use_video = false;
+        use_audio = false;
+        dump_video = false;
+        render_coverart = false;
+        
+        LOGI("=== Gstreamer Disabled ===");
+        LOGI("Video and audio rendering disabled");
+    }
+    // RTP Initialise // May add functionality for rtp streaming and gstreamer at the same time in the future
+    if (rtp_streaming_enabled) {
+    if (!disable_gstreamer) {
+        LOGE("RTP streaming requires -nogst flag");
+        LOGI("Usage: ./uxplay -nogst -rtp host:port");
+        exit(1);
+    }
+    if (init_rtp_socket() != 0) {
+        LOGE("Failed to initialize RTP socket");
+        exit(1);
+    }
+}
+
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
     if (debug_log && suppress_packet_debug_data) {
         log_level = LOGGER_DEBUG;
     }
+
+
 
     
 #ifdef _WIN32    /*  use utf-8 terminal output; don't buffer stdout in WIN32 when debug_log = false */
@@ -2855,7 +3151,8 @@ int main (int argc, char *argv[]) {
     }
 #endif
 
-    LOGI("UxPlay %s: An Open-Source AirPlay mirroring and audio-streaming server.", VERSION);
+    LOGI("FrameXport %s: RTP/UDP AirPlay frame exporter (based on UxPlay)", VERSION);
+  
 
 #ifdef DBUS
     if (scrsv) {
@@ -3164,6 +3461,17 @@ int main (int argc, char *argv[]) {
 }
  
 static void cleanup() {
+        // Close RTP socket if open
+    if (udp_socket >= 0) {
+#ifdef _WIN32
+        closesocket(udp_socket);
+        WSACleanup();
+#else
+        close(udp_socket);
+#endif
+        udp_socket = -1;
+    }
+
     if (use_audio) {
         audio_renderer_destroy();
     }
