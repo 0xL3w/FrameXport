@@ -28,12 +28,11 @@ bash - ./framexport -nogst -rtp 127.0.0.1:5000
 The '-eod' flag automatically exits FrameXport when the IOS device disconnects, instead of waiting indefinitely for reconnection. THis is useful for automated workflows and scripts.
 
 bash examples
-# Exit after 15 seconds (default)
+**Exit after 15 seconds (default)**
 ./framexport -eod
 
-# Exit after 5 seconds
+**Exit after 5 seconds**
 ./framexport -eod 5
-
 
 **Note** The '-nogst' and 'rtp' flags need to be used together in order for FrameXport to work. This does not affect UxPlay default functionality (This may change in future versions)
 
