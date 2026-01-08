@@ -58,18 +58,18 @@ if  ( GST_MACOS )
      message ( STATUS "define GST_MACOS" )
 endif()
 
-add_executable( uxplay uxplay.cpp )
-target_link_libraries( uxplay
+add_executable( framexport uxplay.cpp )
+target_link_libraries( framexport
                    renderers
                    airplay
 		   )
 if (DBUS_FOUND)
-target_link_libraries( uxplay
+target_link_libraries( framexport
 		     ${DBUS_LIBRARIES}
 		     )
 endif()
 
-install( TARGETS  uxplay RUNTIME DESTINATION bin )
+install( TARGETS  framexport RUNTIME DESTINATION bin )
 install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
 install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} ) 
 install( FILES lib/llhttp/LICENSE-MIT DESTINATION ${CMAKE_INSTALL_DOCDIR}/llhttp )
